@@ -15,7 +15,7 @@ import (
 
 var (
 	// global map to store our collectors
-	collectors      sync.Map
+	collectors		sync.Map
 	collectorsMutex = sync.RWMutex{}
 )
 
@@ -74,23 +74,21 @@ func removeStaleCollectors() {
 		collectors.Range(func(key, currCollector interface{}) bool {
 			collector := currCollector.(collector)
 			// TODO (belchy06): Perhaps this time should be configurable
-			if time.Now().Unix()-*collector.lastUpdateTime > 10 {
-				// Collector hasn't been update in X seconds, unregister and remove from our map
-				log.Printf("Deregistering collector for instance \"%s\"", key)
-				prometheus.Unregister(&collector)
-				collectors.Delete(key)
-			}
-
-			prometheus.Unregister(&collector)
 			for name, metric := range collector.metrics {
 				for id, record := range metric.records {
-					if time.Now().Unix()-record.time > 10 {
+					if time.Now().Unix()-record.time > 60 {
 						log.Printf("Deregistering \"%s\" records for player \"%s\"", name, id)
 						delete(metric.records, id)
 					}
 				}
 			}
-			prometheus.Register(&collector)
+
+			if time.Now().Unix()-*collector.lastUpdateTime > 60 {
+				// Collector hasn't been update in X seconds, unregister and remove from our map
+				log.Printf("Deregistering collector for instance \"%s\"", key)
+				prometheus.Unregister(&collector)
+				collectors.Delete(key)
+			}
 			return true
 		})
 		collectorsMutex.Unlock()
@@ -109,9 +107,23 @@ func main() {
 		log.Fatal(err.Error())
 	}
 	defer fs.Close()
+	jsonEncoder := json.NewEncoder(fs)
 
 	// handler for when an instance posts an event
 	http.HandleFunc("/event", func(res http.ResponseWriter, req *http.Request) {
+		// Set CORS headers
+		// using * does not appear to work so we just explicitly allow anywhere
+		origin := req.Header.Get("Origin")
+		res.Header().Set("Access-Control-Allow-Origin", origin) // Allow requests from the requesting origin
+		res.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		if req.Method == http.MethodOptions {
+			res.Header().Set("Access-Control-Allow-Methods", "POST")
+			res.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			res.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
 			http.Error(res, err.Error(), http.StatusBadRequest)
@@ -122,13 +134,15 @@ func main() {
 		json.Unmarshal([]byte(body), &payload)
 
 		// check the event json contains a level, message and id
-		if payload["level"] == nil || payload["message"] == nil || payload["id"] == nil {
+		if payload["id"] == nil {
 			http.Error(res, "Malformed event json. Ensure your message contains all the required fields", http.StatusBadRequest)
 			return
 		}
 
 		var ts = time.Now().Format(time.RFC3339Nano)
-		_, _ = fs.WriteString("{" + "\"log\":\"level=" + payload["level"].(string) + " ts=" + ts + " msg=\\\"" + payload["message"].(string) + "\\\"\", \"stream\":\"" + payload["level"].(string) + "\", \"time\":\"" + ts + "\", \"instance\":\"" + payload["id"].(string) + "\"}\n")
+		payload["time"] = ts
+
+		jsonEncoder.Encode(payload)
 
 		res.WriteHeader(http.StatusOK)
 	})
@@ -155,8 +169,8 @@ func main() {
 			// this is the first time we're seeing this ID, so configure accordingly
 			ts := time.Now().Unix()
 			collector := collector{
-				metadata:       make(map[string]string),
-				metrics:        make(map[string]metric),
+				metadata:		make(map[string]string),
+				metrics:		make(map[string]metric),
 				lastUpdateTime: &ts,
 			}
 
@@ -196,7 +210,7 @@ func main() {
 
 						collector.metrics[key] = metric{
 							description: prometheus.NewDesc(key, metricJson["description"].(string), []string{"player"}, collector.metadata),
-							records:     recordMap,
+							records:	 recordMap,
 						}
 					} else {
 						recordMap := make(map[string]record)
@@ -206,7 +220,7 @@ func main() {
 						}
 						collector.metrics[key] = metric{
 							description: prometheus.NewDesc(key, metricJson["description"].(string), nil, collector.metadata),
-							records:     recordMap,
+							records:	 recordMap,
 						}
 					}
 				}
@@ -231,80 +245,53 @@ func main() {
 		}
 
 		// collector should exist at this point, but check just to be sure
-		currCollector, exists := collectors.Load(id.(string))
+		temp, exists := collectors.Load(id.(string))
 		if !exists {
 			http.Error(res, "Unable to load collector", http.StatusBadRequest)
 			return
 		}
 
 		collectorsMutex.Lock()
+
+		collector := temp.(collector)
 		metricsJson := data.(map[string]interface{})
 		// iterate over all the fields in the "metrics" section
 		for key, value := range metricsJson {
 			metricJson := value.(map[string]interface{})
 
-			if entry, ok := currCollector.(collector).metrics[key]; ok {
-				// update value of copy
-				if valueArray, ok := metricJson["value"].([]interface{}); ok {
-					// if the value object is an array, then loop through this array
-					for _, val := range valueArray {
-						for k, v := range val.(map[string]interface{}) {
-							entry.records[k] = record{
-								value: v.(float64),
-								time:  time.Now().Unix(),
-							}
+			if valueArray, ok := metricJson["value"].([]interface{}); ok {
+				// if the value object is an array, then loop through this array
+				recordMap := make(map[string]record)
+				for _, val := range valueArray {
+					for k, v := range val.(map[string]interface{}) {
+						recordMap[k] = record{
+							value: v.(float64),
+							time:  time.Now().Unix(),
 						}
-					}
-				} else {
-					entry.records[""] = record{
-						value: metricJson["value"].(float64),
-						time:  time.Now().Unix(),
 					}
 				}
 
-				// assign copy to metric
-				currCollector.(collector).metrics[key] = entry
+				collector.metrics[key] = metric{
+					description: prometheus.NewDesc(key, metricJson["description"].(string), []string{"player"}, collector.metadata),
+					records:	 recordMap,
+				}
 			} else {
-				// Unregister the collector from prometheus so we can modify it
-				temp := currCollector.(collector)
-				prometheus.Unregister(&temp)
-
-				if valueArray, ok := metricJson["value"].([]interface{}); ok {
-					// if the value object is an array, then loop through this array
-					recordMap := make(map[string]record)
-					for _, val := range valueArray {
-						for k, v := range val.(map[string]interface{}) {
-							recordMap[k] = record{
-								value: v.(float64),
-								time:  time.Now().Unix(),
-							}
-						}
-					}
-
-					temp.metrics[key] = metric{
-						description: prometheus.NewDesc(key, metricJson["description"].(string), []string{"player"}, temp.metadata),
-						records:     recordMap,
-					}
-				} else {
-					recordMap := make(map[string]record)
-					recordMap[""] = record{
-						value: metricJson["value"].(float64),
-						time:  time.Now().Unix(),
-					}
-					temp.metrics[key] = metric{
-						description: prometheus.NewDesc(key, metricJson["description"].(string), nil, temp.metadata),
-						records:     recordMap,
-					}
+				recordMap := make(map[string]record)
+				recordMap[""] = record{
+					value: metricJson["value"].(float64),
+					time:  time.Now().Unix(),
 				}
-
-				collectors.Store(id, currCollector)
-				// register collector with Prometheus
-				prometheus.Register(&temp)
+				collector.metrics[key] = metric{
+					description: prometheus.NewDesc(key, metricJson["description"].(string), nil, collector.metadata),
+					records:	 recordMap,
+				}
 			}
 		}
 
+		collectors.Store(id, collector)
+
 		// update lastUpdateTime
-		*currCollector.(collector).lastUpdateTime = time.Now().Unix()
+		*collector.lastUpdateTime = time.Now().Unix()
 		collectorsMutex.Unlock()
 		// return OK
 		res.WriteHeader(http.StatusOK)
@@ -315,3 +302,4 @@ func main() {
 
 	log.Fatal(http.ListenAndServe(":8000", nil))
 }
+
