@@ -149,6 +149,19 @@ func main() {
 
 	// handler for when an instance posts its stats
 	http.HandleFunc("/stats", func(res http.ResponseWriter, req *http.Request) {
+		// Set CORS headers
+		// using * does not appear to work so we just explicitly allow anywhere
+		origin := req.Header.Get("Origin")
+		res.Header().Set("Access-Control-Allow-Origin", origin) // Allow requests from the requesting origin
+		res.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		if req.Method == http.MethodOptions {
+			res.Header().Set("Access-Control-Allow-Methods", "POST")
+			res.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			res.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
 			http.Error(res, err.Error(), http.StatusBadRequest)
